@@ -16,7 +16,7 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timezone, timedelta
 from typing import Optional
 
 import redis.asyncio as aioredis
@@ -33,6 +33,7 @@ DISABLED_KEY = "core:disabled_pairs"
 SCHEDULE_KEY = "core:schedule_today"
 ALERTS_CHANNEL = "core:alerts"
 
+KYIV_TZ = timezone(timedelta(hours=3))
 
 class RedisState:
     def __init__(self, host: str, port: int, heartbeat_ttl: int):
@@ -106,7 +107,6 @@ class Scheduler:
         self._active_stop_event: Optional[asyncio.Event] = None
         self._active_task: Optional[asyncio.Task] = None
 
-    # ---------- helpers ----------
 
     def _reset_day_if_needed(self, now: datetime):
         if now.date() != self._today:
@@ -152,11 +152,10 @@ class Scheduler:
             schedule.append(entry)
         return schedule
 
-    # ---------- startup: edge case Б (перезапуск посреди пары) ----------
 
     async def startup_check(self) -> Optional[str]:
         """Возвращает текст алерта, если рестарт произошёл посреди активной пары."""
-        now = datetime.now()
+        now = datetime.now(KYIV_TZ)
         pair = await self.find_active_pair(now)
         if pair is None:
             return None
@@ -174,7 +173,6 @@ class Scheduler:
         await self.redis.publish_alert(text)
         return text
 
-    # ---------- commands ----------
 
     async def process_commands(self):
         while True:
@@ -199,11 +197,10 @@ class Scheduler:
             else:
                 logger.warning("Неизвестная команда: %r", cmd)
 
-    # ---------- main loop ----------
 
     async def run_forever(self):
         while True:
-            now = datetime.now()
+            now = datetime.now(KYIV_TZ)
             self._reset_day_if_needed(now)
 
             await self.process_commands()
@@ -216,7 +213,6 @@ class Scheduler:
                 if pair is not None and pair["index"] not in self._today_outcomes:
                     await self._start_session(pair)
             else:
-                # если время пары истекло, а сессия почему-то ещё не остановилась сама — подстрахуемся
                 nowmin = _now_minutes(now)
                 active_pair = self.pairs[self._active_pair_idx] if self._active_pair_idx is not None else None
                 if active_pair and nowmin > _time_to_minutes(active_pair["end"]) + 2:
