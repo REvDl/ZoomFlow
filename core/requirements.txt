@@ -1,0 +1,2 @@
+redis[hiredis]==5.0.8
+playwright==1.47.0
