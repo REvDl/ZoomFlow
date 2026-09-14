@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   redis:
     image: redis:7-alpine
@@ -19,16 +17,17 @@ services:
       - redis
     env_file: .env
     environment:
+      - TZ=Europe/Kyiv
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-    mem_limit: 400m
-    memswap_limit: 400m
-    shm_size: "256m"
-    # Никакого авто-рестарта при падении/OOM: чтобы не уйти в бесконечный
-    # crashloop на слабой VPS. Оживляет вручную/по алерту controller.
+      - PYTHONUNBUFFERED=1
+    mem_limit: 1024m
+    memswap_limit: 1024m
+    shm_size: "512m"
     restart: "no"
     volumes:
       - ./config.json:/app/config.json:ro
+      - /etc/localtime:/etc/localtime:ro
     networks:
       - internal
 
@@ -39,9 +38,11 @@ services:
       - redis
     env_file: .env
     environment:
+      - TZ=Europe/Kyiv
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - CORE_CONTAINER_NAME=zoom_core
+      - PYTHONUNBUFFERED=1
     mem_limit: 150m
     restart: always
     volumes:
