@@ -1,0 +1,58 @@
+version: "3.8"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: zoom_redis
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "28mb", "--maxmemory-policy", "noeviction"]
+    mem_limit: 32m
+    restart: always
+    volumes:
+      - redis_data:/data
+    networks:
+      - internal
+
+  core:
+    build: ./core
+    container_name: zoom_core
+    depends_on:
+      - redis
+    env_file: .env
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    mem_limit: 400m
+    memswap_limit: 400m
+    shm_size: "256m"
+    # Никакого авто-рестарта при падении/OOM: чтобы не уйти в бесконечный
+    # crashloop на слабой VPS. Оживляет вручную/по алерту controller.
+    restart: "no"
+    volumes:
+      - ./config.json:/app/config.json:ro
+    networks:
+      - internal
+
+  controller:
+    build: ./controller
+    container_name: zoom_controller
+    depends_on:
+      - redis
+    env_file: .env
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CORE_CONTAINER_NAME=zoom_core
+    mem_limit: 150m
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./config.json:/app/config.json:ro
+    networks:
+      - internal
+
+volumes:
+  redis_data:
+
+networks:
+  internal:
+    driver: bridge
