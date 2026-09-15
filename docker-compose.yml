@@ -23,7 +23,7 @@ services:
       - PYTHONUNBUFFERED=1
     mem_limit: 1024m
     memswap_limit: 1024m
-    shm_size: "512m"
+    shm_size: "1gb"
     restart: "no"
     volumes:
       - ./config.json:/app/config.json:ro
