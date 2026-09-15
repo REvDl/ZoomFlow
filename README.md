@@ -1,9 +1,21 @@
 # Zoom auto-join bot (Playwright + Docker)
 
-**Status as of 2026-09-15:** core join/mute/leave logic is implemented and has
-worked in isolated test runs, but a full end-to-end cycle (scheduled join →
-mute → wait → leave) has NOT yet been verified working reliably back-to-back.
-See "Known issues" below before relying on this in production.
+**Status as of 2026-09-15:** join/mute/wait/leave cycle has completed
+successfully end-to-end in **4 real runs** so far — 1 standalone run, plus
+3 back-to-back runs in a single session (config below). All 4 finished
+cleanly (join → in-meeting → mute → wait → leave-with-confirmation →
+cleanup). That's still a small sample — see "Verified vs. still open"
+before assuming everything below is airtight.
+
+Test schedule used for the 3-back-to-back run:
+
+```json
+[
+  {"url": "...", "name": "Иван Иванов", "start": "23:03", "end": "23:05", "days": [1,2,3,4,5]},
+  {"url": "...", "name": "Иван Иванов", "start": "23:07", "end": "23:09", "days": [1,2,3,5]},
+  {"url": "...", "name": "Иван Иванов", "start": "23:11", "end": "23:13", "days": [2]}
+]
+```
 
 ## Quick start
 
@@ -35,70 +47,88 @@ redis       — state, command queue, alert pub/sub (appendonly yes)
 
 core and controller talk **only through Redis** (see key schema in
 `core/scheduler.py`) — controller never talks to core directly, core never
-knows the Telegram token. Alerts that core itself needs to send (e.g. "rejoining
-after restart") are published to the `core:alerts` pub/sub channel, and
-controller forwards them to the chat.
+knows the Telegram token. Alerts core itself needs to send (e.g. "rejoining
+after restart") go through the `core:alerts` pub/sub channel, forwarded by
+controller.
 
-**Known reliability gap:** `core:alerts` is plain Redis pub/sub — if
-`controller` is down/restarting at the moment `core` publishes, that message
-is lost silently (no queue/replay). Observed in practice: a "meeting ended"
-alert arrived while the corresponding "joining meeting" alert never did,
-because controller had restarted in between. If this matters for your use
-case, switch `core:alerts` to a Redis list (`RPUSH`/`BLPOP` or `LPOP` polling)
-instead of pub/sub before relying on alerts.
+**Known reliability gap (unchanged):** `RedisState.publish_alert` still uses
+plain Redis `PUBLISH`. If `controller` is down/restarting at the moment
+`core` publishes, that alert is lost with no replay. Not touched in this
+version — still needs a switch to a list (`RPUSH`/`BLPOP` or `LPOP`
+polling) if guaranteed delivery matters.
 
-## Known issues (as of last testing session)
+## Verified vs. still open
 
-- **Zoom bot detection.** The Zoom Web Client can show "Automated bots
-  aren't allowed to join this meeting" instead of the normal join screen.
-  This appeared intermittently during testing — not on every run, with no
-  fully understood trigger — and is Zoom's own anti-automation measure, not
-  a bug in this code. There is no fix for this in the current architecture;
-  if it becomes a persistent blocker, the realistic long-term option is
-  migrating from browser automation to the official Zoom Meeting SDK, which
-  is a different integration model (no browser page to script) and would
-  require rewriting `zoom_automation.py` from scratch.
-- **`page.goto(..., wait_until="networkidle")` in `_join_flow()` can time
-  out** on the Zoom Web Client because the page has near-constant background
-  network activity (polling, chunked resource loads) and may never reach a
-  500ms idle window. Fix identified but not yet fully verified across
-  multiple runs: switch to `wait_until="domcontentloaded"` and rely on the
-  existing `wait_for_selector(NAME_INPUT, ...)` call right after as the real
-  readiness check.
-- **Leave button click did not reliably trigger the confirm dialog.**
-  Debugged extensively (native `dialog` event handler added, console/pageerror
-  logging added, accessibility-tree snapshot taken) — root cause was never
-  conclusively identified; the confirm dialog is not a native browser dialog,
-  and no new DOM/accessibility element appeared after a normal Playwright
-  `.click()`, only keyboard focus moved to the Leave button. A
-  human-like mouse move + down + pause + up sequence
-  (`_click_leave_humanlike`) was written as an attempt at a fix, plus a
-  fallback that force-closes the page if no confirmation is detected within
-  ~1.5s (relying on Zoom eventually noticing the dropped connection
-  server-side). **Not yet verified working over a real end-to-end run.**
-- **Microphone unmute delay on join.** Currently the bot joins, then waits
-  for the in-meeting footer, then mutes — a multi-second window where the
-  mic is live. Not yet fixed; the intended approach is to mute during the
-  pre-join lobby screen (before entering audio) rather than after joining,
-  but the pre-join screen's DOM/selectors have not yet been captured or
-  scripted.
+**Verified across the 4 logged runs (2026-09-15):**
+- `page.goto(..., wait_until="domcontentloaded")` — no timeout waiting on
+  `NAME_INPUT` in any of the 4 runs. The earlier `networkidle` timeout issue
+  did not reproduce.
+- Leave flow completed with an actual confirmation-button click
+  (`Нажата кнопка подтверждения выхода в модальном окне
+  (button.leave-meeting-options__btn)`) logged in **all 4/4** runs, followed
+  by clean Playwright cleanup. No case yet where the confirm button wasn't
+  found.
+- Zoom's "Automated bots aren't allowed to join this meeting" screen did
+  **not** appear in any of the 4 runs.
+
+**Still open / not resolved by these runs:**
+- No automatic fallback exists in `_leave()` if the confirm-button selectors
+  ever fail to match — code-level fact, simply hasn't been exercised by
+  testing yet since the confirm button was found every time.
+- Zoom bot-detection not appearing in 4 runs is a good sign, not proof it's
+  gone — no explicit detection/handling for that screen exists in
+  `zoom_automation.py` either way.
+- Mic-mute-after-join window (see below) is still architecturally the same
+  as before — mute happens after joining, not in the pre-join lobby.
+
+## Mic-on-join behavior is inconsistent between runs
+
+Across the 4 runs, the mic was sometimes briefly live (with audible
+beeping, since `--use-fake-device-for-media-stream` has no real input) for
+a couple seconds before the explicit mute click, and sometimes already
+muted on arrival with no beeping and no explicit mute click needed. This
+seemed to line up with whether the "Join Audio by Computer" dialog
+appeared or not, but with only 3 data points that's not confirmed — worth
+watching on future runs rather than treating as understood. Either way,
+the pre-join-lobby mute (muting before entering audio at all, so there's no
+live window regardless) is still the real fix and isn't implemented yet.
+
+## Scheduling note: the bot leaves a few minutes after the pair's `end`, not right on time
+
+Confirmed by the 3-pair test: the bot actually left each meeting about
+**3 minutes** after the configured `end`, not immediately. Since a new pair
+can't start until the bot has fully left the previous one, back-to-back
+pairs scheduled with only a 2-minute gap ended up starting about a minute
+late each time — the bot didn't error out, it just queued up behind the
+previous leave.
+
+**Takeaway:** leave at least ~3-4 minutes of buffer between consecutive
+pairs in `config.json`, don't schedule them back-to-back with only a minute
+or two of gap.
+
+## Other things observed in the logs (benign so far)
+
+- Repeated `[console:error] requestStorageAccess: Permission denied.` on
+  every join — did not affect join success in any run, looks like routine
+  Zoom Web Client noise in a third-party-cookie-restricted context.
+- One `[pageerror] OperationError` during the leave sequence in run 1 — did
+  not prevent the confirm click or cleanup from completing.
 
 ## Important caveats
 
-1. **Selector fragility.** `core/zoom_automation.py` clicks through the Zoom
-   Web Client's DOM. Zoom periodically changes its layout — if the bot stops
-   finding the "Join from your browser" button or the name field, check the
-   selector constants at the top of this file (they're commented with what
-   each one targets).
+1. **Selector fragility.** `core/zoom_automation.py` clicks through the
+   Zoom Web Client's DOM (`NAME_INPUT`, `JOIN_BUTTON`, `IN_MEETING_MARKERS`,
+   `WAITING_ROOM_MARKERS`, `MEETING_ENDED_MARKERS`, plus the
+   `_handle_audio_dialog` selector list). If the bot stops finding these,
+   start there.
 2. **Resources.** On a 1 CPU / 2 GB VPS with no swap, headless Chromium is
-   the heaviest process on the box. If you see frequent OOM alerts, either
-   raise `mem_limit` for `core` or add a swap file on the host.
-3. **Your institution's / meeting organizer's policies.** Automating meeting
-   attendance may violate school/work internal rules or Zoom's own terms of
-   use — check this yourself before relying on this long-term.
-4. **`restart: no` for core** — deliberate choice so a bad config doesn't
-   cause an infinite crashloop. After fixing an issue, restart manually:
-   `docker compose up -d core`.
+   the heaviest process on the box. Frequent OOM alerts → raise `mem_limit`
+   for `core` or add host swap.
+3. **Your institution's / meeting organizer's policies.** Automating
+   meeting attendance may violate school/work internal rules or Zoom's own
+   terms of use — check this yourself before relying on this long-term.
+4. **`restart: no` for core** — deliberate, so a bad config doesn't
+   crashloop. After fixing an issue: `docker compose up -d core`.
 
 ## Structure
 
@@ -111,7 +141,7 @@ instead of pub/sub before relying on alerts.
 │   ├── main.py              # entrypoint, on_startup, sys.exit(1) on bad config
 │   ├── config_validator.py  # blocking config.json validation
 │   ├── scheduler.py         # state machine + all Redis interaction
-│   └── zoom_automation.py   # Playwright: join / waiting room / leave
+│   └── zoom_automation.py   # Playwright: join / waiting room / audio / leave
 └── controller/
     ├── Dockerfile
     ├── main.py       # starts bot + both watchdogs + pubsub forwarder
@@ -119,15 +149,20 @@ instead of pub/sub before relying on alerts.
     └── watchdog.py    # docker.sock events + heartbeat staleness
 ```
 
-## Next steps (pick up here)
+## Next steps
 
-1. Apply the `domcontentloaded` fix in `_join_flow()`, test a join on a short
-   (2-3 min) test window in `config.json`.
-2. If join succeeds, verify `_click_leave_humanlike()` actually triggers the
-   confirm dialog (or falls back to `page.close()` cleanly).
-3. If Zoom's bot-detection screen reappears, don't keep retrying immediately
-   — it appeared to be intermittent/session-based rather than a hard
-   permanent ban in testing, so spacing out attempts is a cheaper first
-   thing to try than changing code.
-4. Only if the above stays permanently blocked: evaluate Zoom Meeting SDK as
-   a full rewrite of the join/leave layer.
+1. Run more back-to-back sessions (ideally with the recommended ≥3-4 min
+   gap) to see if the mic-live-vs-pre-muted pattern from run 1/3 vs run 2
+   holds up, and whether it's actually tied to the audio dialog or
+   coincidental.
+2. Keep watching for the Zoom bot-detection screen over more runs before
+   treating the anti-detection tweaks (webdriver spoofing, custom UA,
+   disabled automation flags) as sufficient — 4 clean runs is encouraging
+   but not conclusive.
+3. If tight back-to-back scheduling is actually needed, either shrink the
+   `+2` grace window in `scheduler.py`, or make `find_active_pair` /
+   `_start_session` tolerant of a pair still finishing its leave.
+4. Pre-join-lobby mute (before entering audio at all) is still unimplemented
+   — DOM/selectors for that screen haven't been captured.
+5. `core:alerts` — still plain pub/sub; move to a list if delivery
+   guarantees matter.
