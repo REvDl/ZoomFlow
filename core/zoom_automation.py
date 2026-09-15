@@ -102,15 +102,17 @@ class ZoomAutomation:
         )
 
         self._context = await self._browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-            viewport={"width": 1024, "height": 768},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+            viewport={"width": 1366, "height": 800},
             permissions=["microphone"],
         )
         self._context.set_default_timeout(15000)
         self._context.set_default_navigation_timeout(20000)
 
         self._page = await self._context.new_page()
-
+        self._page.on("dialog", lambda dialog: asyncio.create_task(self._handle_dialog(dialog)))
+        self._page.on("console", lambda msg: logger.info(f"[console:{msg.type}] {msg.text}"))
+        self._page.on("pageerror", lambda err: logger.warning(f"[pageerror] {err}"))
         async def _intercept_route(route):
             if route.request.resource_type == "image":
                 await route.abort()
@@ -122,6 +124,10 @@ class ZoomAutomation:
         await self._page.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
+
+    async def _handle_dialog(self, dialog):
+        logger.info(f"[DIAG] Нативный диалог: type={dialog.type!r} message={dialog.message!r}")
+        await dialog.accept()
 
     async def _join_flow(self) -> None:
         page = self._page
@@ -141,7 +147,7 @@ class ZoomAutomation:
         else:
             target_url = raw_url
 
-        await page.goto(target_url, wait_until="networkidle", timeout=30000)
+        await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
         try:
             cf_frame = page.frame_locator("iframe[src*='challenges.cloudflare.com']")
             cf_checkbox = cf_frame.locator("input[type='checkbox'], #challenge-stage")
@@ -154,7 +160,17 @@ class ZoomAutomation:
         name_field = await page.wait_for_selector(NAME_INPUT, state="visible", timeout=20000)
         await name_field.fill(self.pair["name"])
         try:
-            join_btn = await page.wait_for_selector(JOIN_BUTTON, state="visible", timeout=10000)
+            join_btn = page.locator(JOIN_BUTTON)
+            await join_btn.wait_for(state="visible", timeout=10000)
+            await page.wait_for_function(
+                """(sel) => {
+                    const el = document.querySelector(sel.split(',')[0].trim());
+                    return el && !el.disabled;
+                }""",
+                arg=JOIN_BUTTON,
+                timeout=10000,
+            )
+            await name_field.fill(self.pair["name"])
             await join_btn.click()
             logger.info("Нажата кнопка входа в конференцию")
         except PWTimeout:
@@ -254,87 +270,56 @@ class ZoomAutomation:
             logger.warning(f"Не удалось переключить медиафайлы (возможно, уже выключены или хост заблокировал): {e}")
             await self._debug_screenshot("mute_failed")
 
+    async def _click_leave_humanlike(self) -> bool:
+        box = await self._page.locator(LEAVE_BUTTON).bounding_box()
+        if not box:
+            return False
+        cx = box["x"] + box["width"] / 2
+        cy = box["y"] + box["height"] / 2
+        await self._page.mouse.move(cx - 5, cy - 5)
+        await asyncio.sleep(0.1)
+        await self._page.mouse.move(cx, cy, steps=5)
+        await asyncio.sleep(0.15)
+        await self._page.mouse.down()
+        await asyncio.sleep(0.12)
+        await self._page.mouse.up()
+        await asyncio.sleep(0.3)
+        return True
+
     async def _leave(self):
-        """Выход из конференции — с пробуждением footer перед кликом."""
         logger.info("Выполняю выход из конференции...")
         if not self._page or self._page.is_closed():
             return
 
+        await self._wake_footer()
         try:
-            await self._wake_footer()
-            await self._page.wait_for_selector(LEAVE_BUTTON, timeout=5000)
+            await self._page.wait_for_selector(LEAVE_BUTTON, state="visible", timeout=5000)
+            await asyncio.sleep(0.5)
         except Exception:
-            logger.warning("Footer-панель не появилась перед выходом — клик по Leave может не сработать")
+            logger.warning("Footer-панель не появилась перед выходом")
 
         await self._debug_screenshot("before_leave_click")
 
-        # ДИАГНОСТИКА: смотрим, сколько элементов реально матчит LEAVE_BUTTON
-        # и какие у них координаты/видимость — чтобы понять, не кликаем ли
-        # мы (особенно с force=True) в невидимый/дублирующийся элемент.
+        clicked = False
         try:
-            leave_locator = self._page.locator(LEAVE_BUTTON)
-            count = await leave_locator.count()
-            logger.info(f"[DIAG] Элементов по LEAVE_BUTTON: {count}")
-            for i in range(count):
-                el = leave_locator.nth(i)
-                try:
-                    visible = await el.is_visible()
-                    box = await el.bounding_box()
-                    text = await el.inner_text()
-                    logger.info(f"[DIAG] Leave[{i}]: visible={visible} box={box} text={text!r}")
-                except Exception as diag_e:
-                    logger.info(f"[DIAG] Leave[{i}]: ошибка при инспекции: {diag_e}")
-        except Exception as diag_e:
-            logger.warning(f"[DIAG] Не удалось проинспектировать LEAVE_BUTTON: {diag_e}")
-
-        try:
-            await self._page.click(LEAVE_BUTTON, timeout=4000, force=True)
-            logger.info("Нажата кнопка Leave")
-            # Небольшая пауза, чтобы дать React отрисовать диалог подтверждения,
-            # прежде чем делать скриншот и пытаться искать кнопку confirm.
-            await asyncio.sleep(1)
-            await self._debug_screenshot("after_leave_click")
-
-            # ДИАГНОСТИКА: дампим ВСЕ кнопки на странице после клика — это
-            # покажет реальный текст того, что должно быть кнопкой подтверждения,
-            # даже если наш LEAVE_CONFIRM_BUTTON селектор его не ловит.
-            try:
-                all_buttons = self._page.locator("button")
-                btn_count = await all_buttons.count()
-                logger.info(f"[DIAG] Всего кнопок на странице после клика Leave: {btn_count}")
-                for i in range(min(btn_count, 40)):
-                    b = all_buttons.nth(i)
-                    try:
-                        visible = await b.is_visible()
-                        if not visible:
-                            continue
-                        text = (await b.inner_text()).strip()
-                        aria = await b.get_attribute("aria-label")
-                        logger.info(f"[DIAG] button[{i}]: text={text!r} aria-label={aria!r}")
-                    except Exception:
-                        pass
-            except Exception as diag_e:
-                logger.warning(f"[DIAG] Не удалось задампить кнопки: {diag_e}")
-
+            clicked = await self._click_leave_humanlike()
+            logger.info(f"Клик по Leave (humanlike) выполнен: {clicked}")
         except Exception as e:
-            logger.warning(f"Клик по Leave не сработал: {e}")
-            await self._debug_screenshot("leave_click_failed")
+            logger.warning(f"Humanlike-клик по Leave не сработал: {e}")
+
+        await asyncio.sleep(1.5)
+        await self._debug_screenshot("after_leave_click")
+
+        if await self._is_meeting_ended():
+            logger.info("Встреча завершена, выход подтверждён")
             return
 
+        logger.warning("Confirm не подтверждён после humanlike-клика — закрываю страницу как fallback")
         try:
-            await self._page.click(LEAVE_CONFIRM_BUTTON, timeout=7000)
-            logger.info("Подтверждён выход из конференции")
-            # Даём Zoom время реально отправить disconnect на сервер,
-            # прежде чем мы грубо прибьём браузер в _cleanup().
-            await asyncio.sleep(1.5)
-        except Exception as e:
-            # Confirm-диалога может не быть вообще для обычного участника —
-            # это не обязательно ошибка. Проверяем, не вышли ли мы уже.
-            if await self._is_meeting_ended():
-                logger.info("Confirm-диалог не появился, но встреча уже завершена — выход состоялся")
-            else:
-                logger.warning(f"Не удалось подтвердить выход (confirm не найден): {e}")
-                await self._debug_screenshot("confirm_failed")
+            await self._page.close()
+        except Exception:
+            pass
+
 
     async def run(self) -> str:
         hb_task = asyncio.create_task(self._heartbeat_loop())
@@ -344,16 +329,19 @@ class ZoomAutomation:
             elapsed = 0
             poll_interval = 5
             in_meeting = False
+            last_log = 0
             while elapsed < self.waiting_room_timeout:
                 if self.stop_event.is_set():
                     return "stopped"
                 if await self._is_in_meeting():
                     in_meeting = True
                     break
-                if not await self._is_waiting_room():
-                    await asyncio.sleep(poll_interval)
-                    elapsed += poll_interval
-                    continue
+                if elapsed - last_log >= 30:
+                    waiting = await self._is_waiting_room()
+                    logger.info(f"[DIAG] Ожидание входа: {elapsed}с, waiting_room={waiting}, url={self._page.url}")
+                    last_log = elapsed
+                    if elapsed == 30:  # один раз, для диагностики
+                        await self._debug_screenshot("waiting_room_check")
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
 
